@@ -1,113 +1,108 @@
-name: RDP
+name: Persistent RDP (72h Auto-Restore & Same IP/Password)
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 0 */3 * *'  # Tự chạy lại mỗi 3 ngày (72 tiếng)
 
 jobs:
-  secure-rdp:
+  rdp-server:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 4320 # 72h
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: 🔹 Enable RDP Access
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service TermService
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Secure Password
+      - name: 🔹 Create or Restore RDP User
         run: |
           Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          $passPath = "C:\backup\rdp-pass.txt"
+          if (Test-Path $passPath) {
+            $password = Get-Content $passPath
+            Write-Host "🔁 Reusing existing RDP password."
+          } else {
+            $chars = ([char[]](33..126))
+            $password = -join (1..16 | ForEach-Object { $chars | Get-Random })
+            New-Item -ItemType File -Path $passPath -Force | Out-Null
+            Set-Content -Path $passPath -Value $password
+            Write-Host "🔐 Created new password and saved for reuse."
           }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          } else {
+            Set-LocalUser -Name "RDP" -Password $securePass
+          }
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: 🔹 Install & Connect Tailscale (Static Hostname)
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $path = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $url -OutFile $path
+          Start-Process msiexec.exe -ArgumentList "/i `"$path`" /quiet /norestart" -Wait
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=windows-rdp-stv
+          $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4)[0]
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+      - name: 🔹 Restore Backup (if exists)
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-backup
+          path: C:\backup
+        continue-on-error: true
+
+      - name: 🔹 Extract Previous Environment
+        run: |
+          if (Test-Path C:\backup\system-backup.zip) {
+            Write-Host "🗂️ Restoring full system environment..."
+            Expand-Archive C:\backup\system-backup.zip -DestinationPath C:\ -Force
+          } else {
+            Write-Host "🆕 No previous backup found — starting fresh."
           }
 
-      - name: Install Tailscale
+      - name: 🔹 Show Current RDP Credentials
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          Write-Host "=============================="
+          Write-Host " 🖥️  RDP INFO"
+          Write-Host " Address: $env:TAILSCALE_IP"
+          Write-Host " User: RDP"
+          Write-Host " Pass: $env:RDP_PASSWORD"
+          Write-Host "=============================="
 
-      - name: Establish Tailscale Connection
+      - name: 🔹 Keep Machine Alive (72h with Warnings)
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          for ($i = 0; $i -lt 864; $i++) {
+            $remaining = 72 - ($i * 5 / 60)
+            if ($remaining -le 1) {
+              Write-Host "⚠️  Gần hết thời gian ($remaining giờ còn lại). Sắp sao lưu hệ thống..."
+            }
+            Start-Sleep -Seconds 300
           }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
 
-      - name: Maintain Connection
+      - name: 🔹 Cleanup Temporary Files (Free Disk Space)
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
-          }
+          Write-Host "🧹 Dọn file tạm để tránh đầy ổ C..."
+          Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\Windows\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "✅ Dọn xong!"
+
+      - name: 🔹 Backup Environment (Apps, User Data)
+        run: |
+          Write-Host "💾 Đang sao lưu toàn bộ dữ liệu..."
+          $backupPath = "C:\backup\system-backup.zip"
+          if (Test-Path $backupPath) { Remove-Item $backupPath -Force }
+          Compress-Archive -Path "C:\Users", "C:\Program Files", "C:\ProgramData", "C:\backup" -DestinationPath $backupPath -Force
+
+      - name: 🔹 Upload Backup to GitHub (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-backup
+          path: C:\backup
