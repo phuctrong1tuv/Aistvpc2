@@ -38,7 +38,6 @@ jobs:
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
             Write-Host "✅ Created local user 'RDP'."
           } else {
-            # ensure password is set/updated
             $u = Get-LocalUser -Name "RDP"
             $u | Set-LocalUser -Password $securePass
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
@@ -50,23 +49,16 @@ jobs:
           Write-Host "=== Disk space BEFORE cleanup ==="
           Get-PSDrive -Name C | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,2)}}, @{n='UsedGB';e={[math]::Round(($_.Used)/1GB,2)}} | Format-List
 
-          Write-Host "`n>>> STOP and DISABLE some non-essential services (may improve responsiveness)"
-          # SysMain (Superfetch) can cause IO on some machines; disable to reduce background IO.
+          Write-Host "`n>>> STOP and DISABLE some non-essential services"
           if (Get-Service -Name "SysMain" -ErrorAction SilentlyContinue) {
             Stop-Service -Name "SysMain" -Force -ErrorAction SilentlyContinue
             Set-Service -Name "SysMain" -StartupType Disabled
             Write-Host " - SysMain stopped & disabled."
           }
 
-          # Optionally disable Windows Search (comment/uncomment if you want)
-          # Stop-Service -Name "WSearch" -Force -ErrorAction SilentlyContinue
-          # Set-Service -Name "WSearch" -StartupType Disabled
-
-          Write-Host "`n>>> Clear temporary files (Windows temp, user temp, recycle bin, explorer thumbnail cache)"
+          Write-Host "`n>>> Clear temporary files"
           Try {
-            # Windows temp
             Get-ChildItem -Path 'C:\Windows\Temp' -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
-            # All users temp
             $userTempPaths = Get-ChildItem -Path C:\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
               Join-Path $_.FullName "AppData\Local\Temp"
             }
@@ -76,7 +68,6 @@ jobs:
               }
             }
             Clear-RecycleBin -Force -ErrorAction SilentlyContinue
-            # Explorer thumbnail cache
             $thumbPath = "$env:localappdata\Microsoft\Windows\Explorer"
             Get-ChildItem $thumbPath -Filter "*thumbcache*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
             Write-Host " - Temp, recycle bin, thumbnails cleared."
@@ -84,54 +75,27 @@ jobs:
             Write-Warning "Could not fully clear some temp paths: $_"
           }
 
-          Write-Host "`n>>> Turn off hibernation to remove hiberfil.sys (frees large space)"
+          Write-Host "`n>>> Turn off hibernation"
           Try {
             powercfg -h off
-            Write-Host " - Hibernation disabled (hiberfile removed)."
+            Write-Host " - Hibernation disabled."
           } Catch {
-            Write-Warning " - Failed to run powercfg -h off: $_"
+            Write-Warning " - Failed to disable hibernation: $_"
           }
 
-          Write-Host "`n>>> DISM / Component cleanup (will reduce WinSxS size). This can be slow."
-          # StartComponentCleanup is non-destructive and safe. ResetBase is optional but more permanent and prevents uninstalling updates.
-          Start-Process -FilePath dism.exe -ArgumentList "/Online","/Cleanup-Image","/StartComponentCleanup" -Wait -NoNewWindow
-          # Optionally uncomment ResetBase if you want to permanently remove the ability to uninstall updates (more space, irreversible)
-          # Start-Process -FilePath dism.exe -ArgumentList "/Online","/Cleanup-Image","/StartComponentCleanup","/ResetBase" -Wait -NoNewWindow
-
-          Write-Host "`n>>> Remove Windows.old if present (if you are sure)"
-          if (Test-Path "C:\Windows.old") {
-            Try {
-              Remove-Item -Path "C:\Windows.old" -Recurse -Force -ErrorAction SilentlyContinue
-              Write-Host " - Removed C:\Windows.old"
-            } Catch {
-              Write-Warning " - Could not remove Windows.old: $_"
-            }
-          }
-
-          Write-Host "`n>>> Trim / Optimize volume (for SSDs) and defrag for HDDs"
+          Write-Host "`n>>> Optimize volume"
           Try {
             Optimize-Volume -DriveLetter C -ReTrim -Verbose -ErrorAction SilentlyContinue
             Optimize-Volume -DriveLetter C -Defrag -Verbose -ErrorAction SilentlyContinue
             Write-Host " - Optimize-Volume executed."
           } Catch {
-            Write-Warning " - Optimize-Volume failed or not applicable: $_"
+            Write-Warning " - Optimize-Volume failed: $_"
           }
 
-          Write-Host "`n>>> Set Visual Effects to 'Adjust for best performance' (reduces UI lag on low-resource machines)"
+          Write-Host "`n>>> Set power plan to High performance"
           Try {
-            # 2 = Adjust for best performance
-            New-Item -Path HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects -Force | Out-Null
-            Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Name 'VisualFXSetting' -Value 2 -Type DWord -Force
-            Write-Host " - VisualFXSetting set to 2 (best performance)."
-          } Catch {
-            Write-Warning " - Could not set VisualFXSetting: $_"
-          }
-
-          Write-Host "`n>>> Set power plan to High performance (reduces latency)"
-          Try {
-            # SCHEME_MIN = High Performance GUID might differ; use alias
             powercfg /SETACTIVE SCHEME_MIN
-            Write-Host " - Power plan set to High performance (if available)."
+            Write-Host " - Power plan set to High performance."
           } Catch {
             Write-Warning " - Could not set power plan: $_"
           }
@@ -139,4 +103,10 @@ jobs:
           Write-Host "`n>>> Report disk space AFTER cleanup"
           Get-PSDrive -Name C | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,2)}}, @{n='UsedGB';e={[math]::Round(($_.Used)/1GB,2)}} | Format-List
 
-          Write-Host "`n✅ Cleanup step completed. Note: some operations (DISM ResetBase, powercfg changes) may require a reboot to fully apply."
+      - name: 🔄 Maintain RDP Connection (Prevent Timeout)
+        run: |
+          Write-Host "[10/18/2025] RDP Active - Use Ctrl+C in workflow to terminate"
+          while ($true) {
+            Start-Sleep -Seconds 300
+            Write-Host "[KEEPALIVE] RDP session is active - $(Get-Date)"
+          }
