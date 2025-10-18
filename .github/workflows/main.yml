@@ -34,75 +34,109 @@ jobs:
           }
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-            Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+            New-LocalUser -Name "RDP" -Password $securePass -FullName "RDP User" -Description "Persistent RDP account"
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+            Write-Host "✅ Created local user 'RDP'."
           } else {
-            Set-LocalUser -Name "RDP" -Password $securePass
-          }
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-
-      - name: 🔹 Install & Connect Tailscale (Static Hostname)
-        run: |
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $path = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $url -OutFile $path
-          Start-Process msiexec.exe -ArgumentList "/i `"$path`" /quiet /norestart" -Wait
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=windows-rdp-stv
-          $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4)[0]
-          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-
-      - name: 🔹 Restore Backup (if exists)
-        uses: actions/download-artifact@v4
-        with:
-          name: windows-backup
-          path: C:\backup
-        continue-on-error: true
-
-      - name: 🔹 Extract Previous Environment
-        run: |
-          if (Test-Path C:\backup\system-backup.zip) {
-            Write-Host "🗂️ Restoring full system environment..."
-            Expand-Archive C:\backup\system-backup.zip -DestinationPath C:\ -Force
-          } else {
-            Write-Host "🆕 No previous backup found — starting fresh."
+            # ensure password is set/updated
+            $u = Get-LocalUser -Name "RDP"
+            $u | Set-LocalUser -Password $securePass
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+            Write-Host "♻️ Updated existing user 'RDP' password and ensured RD group membership."
           }
 
-      - name: 🔹 Show Current RDP Credentials
+      - name: 🧹 Cleanup: Free disk space & reduce lag (report before/after)
         run: |
-          Write-Host "=============================="
-          Write-Host " 🖥️  RDP INFO"
-          Write-Host " Address: $env:TAILSCALE_IP"
-          Write-Host " User: RDP"
-          Write-Host " Pass: $env:RDP_PASSWORD"
-          Write-Host "=============================="
+          Write-Host "=== Disk space BEFORE cleanup ==="
+          Get-PSDrive -Name C | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,2)}}, @{n='UsedGB';e={[math]::Round(($_.Used)/1GB,2)}} | Format-List
 
-      - name: 🔹 Keep Machine Alive (72h with Warnings)
-        run: |
-          for ($i = 0; $i -lt 864; $i++) {
-            $remaining = 72 - ($i * 5 / 60)
-            if ($remaining -le 1) {
-              Write-Host "⚠️  Gần hết thời gian ($remaining giờ còn lại). Sắp sao lưu hệ thống..."
+          Write-Host "`n>>> STOP and DISABLE some non-essential services (may improve responsiveness)"
+          # SysMain (Superfetch) can cause IO on some machines; disable to reduce background IO.
+          if (Get-Service -Name "SysMain" -ErrorAction SilentlyContinue) {
+            Stop-Service -Name "SysMain" -Force -ErrorAction SilentlyContinue
+            Set-Service -Name "SysMain" -StartupType Disabled
+            Write-Host " - SysMain stopped & disabled."
+          }
+
+          # Optionally disable Windows Search (comment/uncomment if you want)
+          # Stop-Service -Name "WSearch" -Force -ErrorAction SilentlyContinue
+          # Set-Service -Name "WSearch" -StartupType Disabled
+
+          Write-Host "`n>>> Clear temporary files (Windows temp, user temp, recycle bin, explorer thumbnail cache)"
+          Try {
+            # Windows temp
+            Get-ChildItem -Path 'C:\Windows\Temp' -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+            # All users temp
+            $userTempPaths = Get-ChildItem -Path C:\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+              Join-Path $_.FullName "AppData\Local\Temp"
             }
-            Start-Sleep -Seconds 300
+            foreach ($p in $userTempPaths) {
+              if (Test-Path $p) {
+                Get-ChildItem -Path $p -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+              }
+            }
+            Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+            # Explorer thumbnail cache
+            $thumbPath = "$env:localappdata\Microsoft\Windows\Explorer"
+            Get-ChildItem $thumbPath -Filter "*thumbcache*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            Write-Host " - Temp, recycle bin, thumbnails cleared."
+          } Catch {
+            Write-Warning "Could not fully clear some temp paths: $_"
           }
 
-      - name: 🔹 Cleanup Temporary Files (Free Disk Space)
-        run: |
-          Write-Host "🧹 Dọn file tạm để tránh đầy ổ C..."
-          Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item "C:\Windows\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
-          Write-Host "✅ Dọn xong!"
+          Write-Host "`n>>> Turn off hibernation to remove hiberfil.sys (frees large space)"
+          Try {
+            powercfg -h off
+            Write-Host " - Hibernation disabled (hiberfile removed)."
+          } Catch {
+            Write-Warning " - Failed to run powercfg -h off: $_"
+          }
 
-      - name: 🔹 Backup Environment (Apps, User Data)
-        run: |
-          Write-Host "💾 Đang sao lưu toàn bộ dữ liệu..."
-          $backupPath = "C:\backup\system-backup.zip"
-          if (Test-Path $backupPath) { Remove-Item $backupPath -Force }
-          Compress-Archive -Path "C:\Users", "C:\Program Files", "C:\ProgramData", "C:\backup" -DestinationPath $backupPath -Force
+          Write-Host "`n>>> DISM / Component cleanup (will reduce WinSxS size). This can be slow."
+          # StartComponentCleanup is non-destructive and safe. ResetBase is optional but more permanent and prevents uninstalling updates.
+          Start-Process -FilePath dism.exe -ArgumentList "/Online","/Cleanup-Image","/StartComponentCleanup" -Wait -NoNewWindow
+          # Optionally uncomment ResetBase if you want to permanently remove the ability to uninstall updates (more space, irreversible)
+          # Start-Process -FilePath dism.exe -ArgumentList "/Online","/Cleanup-Image","/StartComponentCleanup","/ResetBase" -Wait -NoNewWindow
 
-      - name: 🔹 Upload Backup to GitHub (Artifact)
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-backup
-          path: C:\backup
+          Write-Host "`n>>> Remove Windows.old if present (if you are sure)"
+          if (Test-Path "C:\Windows.old") {
+            Try {
+              Remove-Item -Path "C:\Windows.old" -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host " - Removed C:\Windows.old"
+            } Catch {
+              Write-Warning " - Could not remove Windows.old: $_"
+            }
+          }
+
+          Write-Host "`n>>> Trim / Optimize volume (for SSDs) and defrag for HDDs"
+          Try {
+            Optimize-Volume -DriveLetter C -ReTrim -Verbose -ErrorAction SilentlyContinue
+            Optimize-Volume -DriveLetter C -Defrag -Verbose -ErrorAction SilentlyContinue
+            Write-Host " - Optimize-Volume executed."
+          } Catch {
+            Write-Warning " - Optimize-Volume failed or not applicable: $_"
+          }
+
+          Write-Host "`n>>> Set Visual Effects to 'Adjust for best performance' (reduces UI lag on low-resource machines)"
+          Try {
+            # 2 = Adjust for best performance
+            New-Item -Path HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects -Force | Out-Null
+            Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Name 'VisualFXSetting' -Value 2 -Type DWord -Force
+            Write-Host " - VisualFXSetting set to 2 (best performance)."
+          } Catch {
+            Write-Warning " - Could not set VisualFXSetting: $_"
+          }
+
+          Write-Host "`n>>> Set power plan to High performance (reduces latency)"
+          Try {
+            # SCHEME_MIN = High Performance GUID might differ; use alias
+            powercfg /SETACTIVE SCHEME_MIN
+            Write-Host " - Power plan set to High performance (if available)."
+          } Catch {
+            Write-Warning " - Could not set power plan: $_"
+          }
+
+          Write-Host "`n>>> Report disk space AFTER cleanup"
+          Get-PSDrive -Name C | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,2)}}, @{n='UsedGB';e={[math]::Round(($_.Used)/1GB,2)}} | Format-List
+
+          Write-Host "`n✅ Cleanup step completed. Note: some operations (DISM ResetBase, powercfg changes) may require a reboot to fully apply."
